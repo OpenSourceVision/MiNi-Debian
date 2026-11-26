@@ -1,0 +1,368 @@
+name: Build minimal Debian image (SSH ready, proxy-kernel friendly)
+
+on:
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: 'Debian suite'
+        required: true
+        default: trixie
+        type: choice
+        options:
+          - trixie
+          - bookworm
+      arch:
+        description: 'Target architecture (arm64 needs a public repo or an arm64 larger runner)'
+        required: true
+        default: amd64
+        type: choice
+        options:
+          - amd64
+          - arm64
+      root_password:
+        description: 'Initial root password (change it after first login)'
+        required: true
+        default: '9527'
+        type: string
+      image_size_mb:
+        description: 'Raw disk image size in MiB'
+        required: true
+        default: '2048'
+        type: string
+  push:
+    tags:
+      - 'debian-*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-minimal-debian-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SUITE: ${{ inputs.suite || 'trixie' }}
+  ARCH: ${{ inputs.arch || 'amd64' }}
+  ROOT_PASSWORD: ${{ inputs.root_password || '9527' }}
+  IMAGE_SIZE_MB: ${{ inputs.image_size_mb || '2048' }}
+  WORKDIR: ${{ github.workspace }}/build
+  ROOTFS: ${{ github.workspace }}/build/rootfs
+  DIST: ${{ github.workspace }}/dist
+
+jobs:
+  build:
+    runs-on: ${{ (inputs.arch == 'arm64' && 'ubuntu-24.04-arm') || 'ubuntu-24.04' }}
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install host build tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            debootstrap gdisk dosfstools e2fsprogs rsync curl ca-certificates \
+            xz-utils binutils
+
+          # Always verify against the current Debian archive keyring.
+          KEYRING_DEB=$(curl -fsSL https://deb.debian.org/debian/pool/main/d/debian-archive-keyring/ \
+            | grep -oE 'debian-archive-keyring_[0-9][^"<>]*_all\.deb' | sort -Vu | tail -n 1)
+          test -n "$KEYRING_DEB"
+          curl -fsSL -o /tmp/debian-archive-keyring.deb \
+            "https://deb.debian.org/debian/pool/main/d/debian-archive-keyring/$KEYRING_DEB"
+          sudo dpkg -i /tmp/debian-archive-keyring.deb
+
+          # Older debootstrap releases may not ship a trixie script.
+          if [ ! -e "/usr/share/debootstrap/scripts/$SUITE" ]; then
+            sudo ln -s /usr/share/debootstrap/scripts/bookworm \
+              "/usr/share/debootstrap/scripts/$SUITE"
+          fi
+
+      - name: Build Debian rootfs
+        run: |
+          set -euo pipefail
+          mkdir -p "$WORKDIR" "$DIST" \
+            "$ROOTFS/dev/pts" "$ROOTFS/proc" "$ROOTFS/sys" \
+            "$ROOTFS/etc/systemd/network" \
+            "$ROOTFS/etc/ssh/sshd_config.d" \
+            "$ROOTFS/etc/sysctl.d" \
+            "$ROOTFS/etc/modules-load.d" \
+            "$ROOTFS/etc/systemd/system"
+
+          if [ "$ARCH" = "amd64" ]; then
+            KERNEL_PKG=linux-image-amd64
+            GRUB_PKGS=grub-pc-bin,grub-efi-amd64-bin
+          else
+            KERNEL_PKG=linux-image-arm64
+            GRUB_PKGS=grub-efi-arm64-bin
+          fi
+
+          sudo env DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC \
+            debootstrap \
+              --arch="$ARCH" \
+              --variant=minbase \
+              --keyring=/usr/share/keyrings/debian-archive-keyring.gpg \
+              --include="ca-certificates,openssh-server,systemd-sysv,systemd-resolved,systemd-timesyncd,iproute2,iputils-ping,iptables,kmod,procps,curl,wget,jq,tar,xz-utils,unzip,libcap2-bin,bpftool,nano,initramfs-tools,$KERNEL_PKG,$GRUB_PKGS" \
+              "$SUITE" "$ROOTFS" https://deb.debian.org/debian
+
+          echo 'debian-minimal' | sudo tee "$ROOTFS/etc/hostname" >/dev/null
+          sudo tee "$ROOTFS/etc/hosts" >/dev/null <<'EOF'
+          127.0.0.1 localhost debian-minimal
+          ::1       localhost ip6-localhost ip6-loopback
+          fe00::0   ip6-localnet
+          ff00::0   ip6-mcastprefix
+          ff02::1   ip6-allnodes
+          ff02::2   ip6-allrouters
+          EOF
+
+          echo 'LANG=C.UTF-8' | sudo tee "$ROOTFS/etc/default/locale" >/dev/null
+          echo 'Etc/UTC' | sudo tee "$ROOTFS/etc/timezone" >/dev/null
+          sudo ln -sf /usr/share/zoneinfo/Etc/UTC "$ROOTFS/etc/localtime"
+
+          sudo rm -f "$ROOTFS/etc/resolv.conf"
+          sudo ln -s ../run/systemd/resolve/stub-resolv.conf "$ROOTFS/etc/resolv.conf"
+
+          # DHCP on wired links; tunnel/virtual interfaces are intentionally excluded.
+          sudo tee "$ROOTFS/etc/systemd/network/10-dhcp.network" >/dev/null <<'EOF'
+          [Match]
+          Kind=ether
+
+          [Network]
+          DHCP=yes
+          IPv6AcceptRA=yes
+
+          [DHCP]
+          UseDNS=yes
+          EOF
+
+          sudo tee "$ROOTFS/etc/ssh/sshd_config.d/10-image.conf" >/dev/null <<'EOF'
+          PermitRootLogin yes
+          PasswordAuthentication yes
+          KbdInteractiveAuthentication yes
+          EOF
+
+          sudo tee "$ROOTFS/etc/motd" >/dev/null <<EOF
+          ------------------------------------------------------------
+          Debian minimal image ($SUITE / $ARCH)
+          Initial login: root / $ROOT_PASSWORD
+          CHANGE THE PASSWORD IMMEDIATELY AND RESTRICT SSH EXPOSURE.
+          This is a base image for manually deploying honk / mihomo.
+          ------------------------------------------------------------
+          EOF
+
+          # Prerequisites for honk (bpffs + eBPF/TC) and mihomo (TUN + forwarding).
+          sudo tee "$ROOTFS/etc/sysctl.d/99-proxy-kernels.conf" >/dev/null <<'EOF'
+          net.ipv4.ip_forward=1
+          net.ipv6.conf.all.forwarding=1
+          net.ipv4.conf.all.rp_filter=0
+          net.ipv4.conf.default.rp_filter=0
+          net.core.rmem_max=67108864
+          net.core.wmem_max=67108864
+          EOF
+
+          sudo tee "$ROOTFS/etc/modules-load.d/proxy-kernels.conf" >/dev/null <<'EOF'
+          tun
+          nf_conntrack
+          EOF
+
+          sudo tee "$ROOTFS/etc/systemd/system/sys-fs-bpf.mount" >/dev/null <<'EOF'
+          [Unit]
+          Description=BPF filesystem for honk / eBPF proxies
+          Before=local-fs.target
+
+          [Mount]
+          What=bpf
+          Where=/sys/fs/bpf
+          Type=bpf
+          Options=mode=755,nosuid,nodev,noexec
+
+          [Install]
+          WantedBy=local-fs.target
+          EOF
+
+          printf 'root:%s\n' "$ROOT_PASSWORD" | sudo chroot "$ROOTFS" chpasswd
+
+          sudo mount -t proc proc "$ROOTFS/proc"
+          sudo mount -t sysfs sys "$ROOTFS/sys"
+          sudo mount --bind /dev "$ROOTFS/dev"
+          sudo mount --bind /dev/pts "$ROOTFS/dev/pts"
+          sudo chroot "$ROOTFS" /bin/bash -e <<'CHROOT'
+          systemctl enable ssh.service
+          systemctl enable systemd-networkd.service
+          systemctl enable systemd-resolved.service
+          systemctl enable systemd-timesyncd.service
+          systemctl enable sys-fs-bpf.mount
+          ssh-keygen -A
+          update-initramfs -u -k all
+          apt-get clean
+          rm -rf /var/lib/apt/lists/*
+          CHROOT
+          sudo umount "$ROOTFS/dev/pts" || true
+          sudo umount "$ROOTFS/dev" || true
+          sudo umount "$ROOTFS/sys" || true
+          sudo umount "$ROOTFS/proc" || true
+
+      - name: Build bootable raw disk image
+        run: |
+          set -euo pipefail
+          IMG="$WORKDIR/debian-$SUITE-$ARCH.img"
+          MNT="$WORKDIR/mnt"
+          LOOP=""
+
+          cleanup() {
+            sudo umount "$MNT/boot/efi" 2>/dev/null || true
+            sudo umount "$MNT/dev/pts" 2>/dev/null || true
+            sudo umount "$MNT/dev" 2>/dev/null || true
+            sudo umount "$MNT/sys" 2>/dev/null || true
+            sudo umount "$MNT/proc" 2>/dev/null || true
+            sudo umount "$MNT" 2>/dev/null || true
+            if [ -n "$LOOP" ]; then sudo losetup -d "$LOOP" 2>/dev/null || true; fi
+          }
+          trap cleanup EXIT
+
+          sudo truncate -s "${IMAGE_SIZE_MB}M" "$IMG"
+          if [ "$ARCH" = "amd64" ]; then
+            sudo sgdisk --clear \
+              --new=1:1M:+2M --typecode=1:ef02 --change-name=1:'BIOS Boot' \
+              --new=2:3M:+512M --typecode=2:ef00 --change-name=2:'EFI System' \
+              --new=3:515M:0 --typecode=3:8300 --change-name=3:'Debian Root' \
+              "$IMG"
+            EFI_PART=p2
+            ROOT_PART=p3
+          else
+            sudo sgdisk --clear \
+              --new=1:1M:+512M --typecode=1:ef00 --change-name=1:'EFI System' \
+              --new=2:513M:0 --typecode=2:8300 --change-name=2:'Debian Root' \
+              "$IMG"
+            EFI_PART=p1
+            ROOT_PART=p2
+          fi
+
+          LOOP=$(sudo losetup --find --show --partscan "$IMG")
+          sudo mkfs.vfat -F32 -n EFI "${LOOP}${EFI_PART}"
+          sudo mkfs.ext4 -F -L ROOT "${LOOP}${ROOT_PART}"
+
+          sudo mkdir -p "$MNT"
+          sudo mount "${LOOP}${ROOT_PART}" "$MNT"
+          sudo mkdir -p "$MNT/boot/efi"
+          sudo mount "${LOOP}${EFI_PART}" "$MNT/boot/efi"
+          sudo rsync -aHAX --numeric-ids "$ROOTFS"/ "$MNT"/
+
+          ROOT_UUID=$(sudo blkid -s UUID -o value "${LOOP}${ROOT_PART}")
+          EFI_UUID=$(sudo blkid -s UUID -o value "${LOOP}${EFI_PART}")
+          sudo tee "$MNT/etc/fstab" >/dev/null <<EOF
+          UUID=$ROOT_UUID / ext4 defaults,noatime 0 1
+          UUID=$EFI_UUID /boot/efi vfat defaults,umask=0077 0 2
+          EOF
+
+          sudo mount -t proc proc "$MNT/proc"
+          sudo mount -t sysfs sys "$MNT/sys"
+          sudo mount --bind /dev "$MNT/dev"
+          sudo mount --bind /dev/pts "$MNT/dev/pts"
+
+          LOOP_NAME=$(basename "$LOOP")
+          if [ "$ARCH" = "amd64" ]; then
+            sudo chroot "$MNT" grub-install --target=i386-pc --force "/dev/$LOOP_NAME"
+            sudo chroot "$MNT" grub-install --target=x86_64-efi --efi-directory=/boot/efi --removable --no-nvram
+          else
+            sudo chroot "$MNT" grub-install --target=arm64-efi --efi-directory=/boot/efi --removable --no-nvram
+          fi
+          sudo chroot "$MNT" update-grub
+          sudo chroot "$MNT" update-initramfs -u -k all
+
+          test -f "$MNT/boot/efi/EFI/BOOT/BOOTX64.EFI" || \
+            test -f "$MNT/boot/efi/EFI/BOOT/BOOTAA64.EFI"
+
+      - name: Package and verify artifacts
+        run: |
+          set -euo pipefail
+          BASE="debian-$SUITE-$ARCH"
+          sudo tar --numeric-owner -cJf "$DIST/${BASE}-rootfs.tar.xz" -C "$ROOTFS" .
+          xz -T0 -6 -c "$WORKDIR/${BASE}.img" > "$DIST/${BASE}.img.xz"
+          ( cd "$DIST" && sha256sum * > SHA256SUMS )
+          tar -tJf "$DIST/${BASE}-rootfs.tar.xz" >/dev/null
+          xz -t "$DIST/${BASE}.img.xz"
+          ls -lh "$DIST"
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          BASE="debian-$SUITE-$ARCH"
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            TAG="$GITHUB_REF_NAME"
+          else
+            TAG="${BASE}-$(date -u +%Y%m%d)-r${GITHUB_RUN_NUMBER}"
+          fi
+
+          KERNEL_NOTE="The Debian $SUITE generic kernel meets honk's Linux >= 6.12 requirement."
+          if [ "$SUITE" = "bookworm" ]; then
+            KERNEL_NOTE="WARNING: bookworm ships a 6.1 kernel, below honk's Linux >= 6.12 floor. Use trixie or install a newer kernel before deploying honk."
+          fi
+
+          NOTES="$WORKDIR/RELEASE_NOTES.md"
+          cat > "$NOTES" <<EOF
+          # $BASE minimal Debian image
+
+          Built from Debian $SUITE ($ARCH). Artifacts:
+          - \`${BASE}.img.xz\` — bootable raw disk image (dd to a disk or use as a VM disk)
+          - \`${BASE}-rootfs.tar.xz\` — root filesystem tarball for chroot / existing systems
+          - \`SHA256SUMS\` — checksums
+
+          ## Default access
+          - User: \`root\`
+          - Password: \`$ROOT_PASSWORD\`
+
+          **Security warning:** the default password is weak and SSH password login is enabled.
+          Change the password and restrict network exposure before any real use.
+
+          ## Preconfigured
+          - OpenSSH server enabled, root password login allowed
+          - systemd-networkd with DHCP on wired links
+          - systemd-timesyncd and systemd-resolved enabled
+          - \`/sys/fs/bpf\` mounted at boot (honk / eBPF requirement)
+          - \`tun\` and \`nf_conntrack\` loaded at boot
+          - IP forwarding, rp_filter=0, larger socket buffers in \`/etc/sysctl.d/99-proxy-kernels.conf\`
+          - Tools: \`curl\`, \`wget\`, \`jq\`, \`tar\`, \`xz-utils\`, \`unzip\`, \`libcap2-bin\`, \`iptables\`, \`iproute2\`, \`bpftool\`, \`kmod\`, \`nano\`
+
+          ## Proxy kernel compatibility
+          Kernel binaries are **not bundled**; download and deploy them manually after boot.
+          - **honk**: requires Linux >= 6.12 with BPF/TC/TPROXY support and bpffs. $KERNEL_NOTE The bpffs mount is preconfigured. honk cannot coexist with dae (both use dae0).
+          - **mihomo**: TUN mode needs \`/dev/net/tun\`, CAP_NET_ADMIN and IPv4/IPv6 forwarding; all are enabled or preloaded here.
+
+          ## Usage
+          Write the raw image (replace sdX; all data on the target disk will be erased):
+          \`\`\`sh
+          xz -dc ${BASE}.img.xz | sudo dd of=/dev/sdX bs=4M status=progress
+          \`\`\`
+
+          Extract the rootfs tarball:
+          \`\`\`sh
+          sudo mkdir -p /mnt/debian
+          sudo tar -xJf ${BASE}-rootfs.tar.xz -C /mnt/debian
+          \`\`\`
+
+          Verify checksums:
+          \`\`\`sh
+          sha256sum -c SHA256SUMS
+          \`\`\`
+          EOF
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$DIST"/* --clobber
+          else
+            gh release create "$TAG" "$DIST"/* \
+              --title "$BASE minimal Debian ($(date -u +%Y-%m-%d))" \
+              --notes-file "$NOTES"
+          fi
+
+      - name: Cleanup mount points
+        if: always()
+        run: |
+          for m in "$ROOTFS/dev/pts" "$ROOTFS/dev" "$ROOTFS/sys" "$ROOTFS/proc" \
+                   "$WORKDIR/mnt/boot/efi" "$WORKDIR/mnt/dev/pts" "$WORKDIR/mnt/dev" \
+                   "$WORKDIR/mnt/sys" "$WORKDIR/mnt/proc" "$WORKDIR/mnt"; do
+            sudo umount "$m" 2>/dev/null || true
+          done
