@@ -74,7 +74,8 @@ jobs:
           sudo dpkg -i /tmp/debian-archive-keyring.deb
 
           # Older debootstrap releases may not ship a trixie script.
-          if [ ! -e "/usr/share/debootstrap/scripts/$SUITE" ]; then
+          if [ ! -e "/usr/share/debootstrap/scripts/$SUITE" ] && \
+             [ ! -L "/usr/share/debootstrap/scripts/$SUITE" ]; then
             sudo ln -s /usr/share/debootstrap/scripts/bookworm \
               "/usr/share/debootstrap/scripts/$SUITE"
           fi
@@ -103,7 +104,7 @@ jobs:
               --arch="$ARCH" \
               --variant=minbase \
               --keyring=/usr/share/keyrings/debian-archive-keyring.gpg \
-              --include="ca-certificates,openssh-server,systemd-sysv,systemd-resolved,systemd-timesyncd,iproute2,iputils-ping,iptables,kmod,procps,curl,wget,jq,tar,xz-utils,unzip,libcap2-bin,bpftool,nano,initramfs-tools,$KERNEL_PKG,$GRUB_PKGS" \
+              --include="ca-certificates,openssh-server,systemd-sysv,systemd-timesyncd,iproute2,iputils-ping,iptables,kmod,procps,curl,wget,jq,tar,xz-utils,unzip,libcap2-bin,bpftool,nano,initramfs-tools,$KERNEL_PKG,$GRUB_PKGS" \
               "$SUITE" "$ROOTFS" https://deb.debian.org/debian
 
           echo 'debian-minimal' | sudo tee "$ROOTFS/etc/hostname" >/dev/null
@@ -120,8 +121,13 @@ jobs:
           echo 'Etc/UTC' | sudo tee "$ROOTFS/etc/timezone" >/dev/null
           sudo ln -sf /usr/share/zoneinfo/Etc/UTC "$ROOTFS/etc/localtime"
 
-          sudo rm -f "$ROOTFS/etc/resolv.conf"
-          sudo ln -s ../run/systemd/resolve/stub-resolv.conf "$ROOTFS/etc/resolv.conf"
+          # Static resolvers: systemd-resolved is intentionally not installed,
+          # its postinst breaks debootstrap in a chroot (missing stub-resolv.conf).
+          sudo tee "$ROOTFS/etc/resolv.conf" >/dev/null <<'EOF'
+          nameserver 1.1.1.1
+          nameserver 8.8.8.8
+          nameserver 2606:4700:4700::1111
+          EOF
 
           # DHCP on wired links; tunnel/virtual interfaces are intentionally excluded.
           sudo tee "$ROOTFS/etc/systemd/network/10-dhcp.network" >/dev/null <<'EOF'
@@ -190,7 +196,6 @@ jobs:
           sudo chroot "$ROOTFS" /bin/bash -e <<'CHROOT'
           systemctl enable ssh.service
           systemctl enable systemd-networkd.service
-          systemctl enable systemd-resolved.service
           systemctl enable systemd-timesyncd.service
           systemctl enable sys-fs-bpf.mount
           ssh-keygen -A
@@ -240,6 +245,14 @@ jobs:
           fi
 
           LOOP=$(sudo losetup --find --show --partscan "$IMG")
+          sudo udevadm settle 2>/dev/null || true
+          for part in "${LOOP}${EFI_PART}" "${LOOP}${ROOT_PART}"; do
+            if [ ! -b "$part" ]; then
+              echo "ERROR: partition device $part was not created by losetup --partscan" >&2
+              sudo lsblk "$LOOP" 2>/dev/null || true
+              exit 1
+            fi
+          done
           sudo mkfs.vfat -F32 -n EFI "${LOOP}${EFI_PART}"
           sudo mkfs.ext4 -F -L ROOT "${LOOP}${ROOT_PART}"
 
@@ -263,7 +276,7 @@ jobs:
 
           LOOP_NAME=$(basename "$LOOP")
           if [ "$ARCH" = "amd64" ]; then
-            sudo chroot "$MNT" grub-install --target=i386-pc --force "/dev/$LOOP_NAME"
+            sudo chroot "$MNT" grub-install --target=i386-pc --force --skip-fs-probe "/dev/$LOOP_NAME"
             sudo chroot "$MNT" grub-install --target=x86_64-efi --efi-directory=/boot/efi --removable --no-nvram
           else
             sudo chroot "$MNT" grub-install --target=arm64-efi --efi-directory=/boot/efi --removable --no-nvram
@@ -321,7 +334,7 @@ jobs:
           ## Preconfigured
           - OpenSSH server enabled, root password login allowed
           - systemd-networkd with DHCP on wired links
-          - systemd-timesyncd and systemd-resolved enabled
+          - systemd-timesyncd enabled; static public DNS in /etc/resolv.conf (systemd-resolved is not installed)
           - \`/sys/fs/bpf\` mounted at boot (honk / eBPF requirement)
           - \`tun\` and \`nf_conntrack\` loaded at boot
           - IP forwarding, rp_filter=0, larger socket buffers in \`/etc/sysctl.d/99-proxy-kernels.conf\`
