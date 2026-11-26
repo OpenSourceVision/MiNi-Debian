@@ -104,7 +104,7 @@ jobs:
               --arch="$ARCH" \
               --variant=minbase \
               --keyring=/usr/share/keyrings/debian-archive-keyring.gpg \
-              --include="ca-certificates,openssh-server,systemd-sysv,systemd-timesyncd,iproute2,iputils-ping,iptables,kmod,procps,curl,wget,jq,tar,xz-utils,unzip,libcap2-bin,bpftool,nano,initramfs-tools,grub-common,$KERNEL_PKG,$GRUB_PKGS" \
+              --include="ca-certificates,openssh-server,systemd-sysv,systemd-timesyncd,iproute2,iputils-ping,iptables,kmod,procps,curl,wget,jq,tar,xz-utils,unzip,zstd,libcap2-bin,bpftool,nano,initramfs-tools,grub-common,grub2-common,$KERNEL_PKG,$GRUB_PKGS" \
               "$SUITE" "$ROOTFS" https://deb.debian.org/debian
 
           echo 'debian-minimal' | sudo tee "$ROOTFS/etc/hostname" >/dev/null
