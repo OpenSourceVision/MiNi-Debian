@@ -2,7 +2,7 @@
 
 GitHub Actions 工作流：构建最小化 Debian 系统并自动发布 Release。工作流文件为 [`.github/workflows/build-minimal-debian.yml`](.github/workflows/build-minimal-debian.yml)。
 
-默认基于 Debian testing（`forky`）构建，默认登录 `root` / `9527`。
+固定基于 Debian testing（`forky`）构建，默认登录 `root` / `9527`。
 
 ---
 
@@ -21,7 +21,6 @@ git tag debian-build-001 && git push origin debian-build-001
 
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
-| `suite` | `forky` | 可选 `trixie`、`bookworm`；testing 无 `-updates` / `-security` 套件，源配置已按套件区分 |
 | `arch` | `amd64` | `arm64` 需公开仓库或 arm64 大规格 runner |
 | `root_password` | `9527` | 初始 root 密码 |
 | `image_size_mb` | `2048` | 镜像总容量（MiB），根分区约为减去 515 MiB |
@@ -32,31 +31,57 @@ git tag debian-build-001 && git push origin debian-build-001
 
 | 文件 | 说明 |
 | --- | --- |
-| `debian-<suite>-<arch>.img.xz` | 可启动磁盘镜像，GPT + GRUB（amd64 支持 BIOS/UEFI，arm64 为 UEFI） |
-| `debian-<suite>-<arch>-rootfs.tar.xz` | 根文件系统压缩包，用于已有分区或 chroot |
+| `debian-forky-<arch>.img.xz` | 可启动磁盘镜像，GPT + GRUB（amd64 支持 BIOS/UEFI，arm64 为 UEFI） |
+| `debian-forky-<arch>-rootfs.tar.xz` | 根文件系统压缩包，用于已有分区或 chroot |
 | `SHA256SUMS` | 两个产物的 SHA-256 校验值 |
 
 构建后自动创建 GitHub Release 并上传以上文件；已存在同名 Release 时覆盖上传。
 
 ## 镜像构建内容
 
-- **基础**：`debootstrap --variant=minbase`，含对应架构通用内核、initramfs 与 GRUB。
+- **基础**：`debootstrap --variant=minbase`。内核与 GRUB 在完整挂载的 chroot 阶段安装（避免 debootstrap 内 initramfs-tools 的 postinst 失败），并生成 initramfs。
 - **SSH**：`openssh-server`，允许 root 密码登录，主机密钥构建时生成。
-- **网络**：`systemd-networkd` 对常见网卡名启用 DHCPv4（`10-dhcp.network`），预装 `dhclient`，静态公共 DNS，`systemd-timesyncd`。未安装 `systemd-resolved`（其 postinst 会破坏 chroot 构建）。
-- **系统前置**：`/sys/fs/bpf` 开机挂载，`tun` / `nf_conntrack` 开机加载，开启 IP 转发、关闭 `rp_filter`、增大 socket 缓冲区，内置 `iptables` / `kmod` / `bpftool` / `libcap2-bin`。镜像内 apt 源使用清华 TUNA 国内镜像。
-- **工具**：`curl`、`wget`、`jq`、`tar`、`xz-utils`、`unzip`、`nano`、`iproute2`、`iputils-ping`、`procps`、`isc-dhcp-client`。
+- **网络**：`systemd-networkd` 对常见网卡名启用 DHCPv4（`10-dhcp.network`），预装 `dhcpcd` 作为手动后备，静态公共 DNS，`systemd-timesyncd`。未安装 `systemd-resolved`（其 postinst 会破坏 chroot 构建）。
+- **系统前置**：`/sys/fs/bpf` 由 systemd 作为 API 文件系统自动挂载（不创建自定义 mount 单元，否则 systemd 262+ 会报 bad-setting 错误）；`tun` / `nf_conntrack` 开机加载，开启 IP 转发、关闭 `rp_filter`、增大 socket 缓冲区，内置 `iptables` / `kmod` / `bpftool` / `libcap2-bin`。安装 `dbus` 以支持 `timedatectl` 等管理工具。镜像内 apt 源使用清华 TUNA 国内镜像。
+- **工具**：`curl`、`wget`、`jq`、`tar`、`xz-utils`、`unzip`、`nano`、`iproute2`、`iputils-ping`、`procps`、`dhcpcd-base`。
 - **校验**：构建末段执行 tar/xz 解包测试与 SHA-256 校验和生成。
 
 ---
+
+## 软件包清单（模块化）
+
+软件包不在工作流中写死，而是由两个 YAML 清单提供，**构建时自动读取**：
+
+| 文件 | 用途 |
+| --- | --- |
+| [`config/packages-required.yml`](config/packages-required.yml) | 系统必需包，除非必要不要删。分三组：`bootstrap`（debootstrap 阶段，纯工具）、`chroot`（完整 chroot 阶段）、`arch`（按架构的内核/GRUB） |
+| [`config/packages-optional.yml`](config/packages-optional.yml) | 可选插件。后期只需在 `packages:` 下添加 `- 包名`，重新构建即随镜像安装 |
+
+工作原理：
+
+- `Load package manifests` 步骤解析两个清单，校验包名合法性并去重。
+- `bootstrap` 包进入 `debootstrap --include`；`chroot` + `arch.[当前架构]` + 可选 `packages` 在完整挂载的 chroot 内用 apt 安装。
+- 安装阶段用 policy-rc.d 阻止服务启动，避免插件 postinst 卡住构建。
+- 包名只允许小写字母、数字及 `+ . -`，非法名称会使构建失败并明确指出文件与条目。
+
+添加插件示例（编辑 `config/packages-optional.yml`）：
+
+```yaml
+packages:
+  - docker.io
+  - git
+  - vim
+```
 
 ## 修改构建
 
 | 目标 | 修改位置 |
 | --- | --- |
-| 增删软件包 | `debootstrap --include` 列表 |
-| 默认套件 | workflow 顶层 `env.SUITE` 与 `workflow_dispatch` 输入 |
+| 增删必需包 | `config/packages-required.yml` |
+| 增删插件 | `config/packages-optional.yml` |
+| 切换套件 | workflow 顶层 `env.SUITE`（注意 apt 源套件名需同步） |
 | 网络配置 | `10-dhcp.network` |
-| apt 国内源 | `debian.sources` 生成段（按 suite 区分） |
+| apt 国内源 | `debian.sources` 生成段 |
 | 内核参数 | `99-network-tuning.conf` |
 | 分区与引导 | `sgdisk` / `mkfs` / `grub-install` 步骤 |
 | 发布逻辑 | `Publish GitHub Release` 步骤 |
