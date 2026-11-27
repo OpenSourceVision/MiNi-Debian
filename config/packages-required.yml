@@ -1,0 +1,49 @@
+# ============================================================
+# 系统必需软件包清单
+# ------------------------------------------------------------
+# 由 .github/workflows/build-minimal-debian.yml 在构建时读取。
+# 除非清楚后果，否则不要删除这里的条目。
+#
+# 字段说明：
+#   bootstrap : 由 debootstrap --include 安装，仅放纯用户态工具
+#               （内核与 GRUB 不能放这里，其 postinst 在 debootstrap
+#                 的受限 chroot 中会失败）
+#   chroot    : 在完整挂载 /proc /sys /dev 的 chroot 内用 apt 安装，
+#               适合 postinst 需要完整环境的包
+#   arch      : 按目标架构区分的包，会与 chroot 列表合并后安装
+# ============================================================
+
+bootstrap:
+  - ca-certificates
+  - openssh-server
+  - systemd-sysv
+  - systemd-timesyncd
+  - iproute2
+  - iputils-ping
+  - dhcpcd-base
+  - iptables
+  - kmod
+  - procps
+  - curl
+  - wget
+  - jq
+  - tar
+  - xz-utils
+  - unzip
+  - zstd
+  - libcap2-bin
+  - bpftool
+  - nano
+
+chroot:
+  - grub-common
+  - grub2-common
+
+arch:
+  amd64:
+    - linux-image-amd64
+    - grub-pc-bin
+    - grub-efi-amd64-bin
+  arm64:
+    - linux-image-arm64
+    - grub-efi-arm64-bin
