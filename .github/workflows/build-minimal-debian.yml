@@ -213,6 +213,17 @@ jobs:
           UseDNS=yes
           UseMTU=yes
           UseDomains=yes
+          UseNTP=no
+          EOF
+
+          # Pin time sync to IPv4 literal addresses. systemd-timesyncd has no
+          # IPFamily= option (verified on systemd 262), so avoiding DNS/AAAA
+          # lookups is the only reliable way to prevent slow IPv6 NTP timeouts.
+          sudo mkdir -p "$ROOTFS/etc/systemd/timesyncd.conf.d"
+          sudo tee "$ROOTFS/etc/systemd/timesyncd.conf.d/10-ipv4-only.conf" >/dev/null <<'EOF'
+          [Time]
+          NTP=203.107.6.88 1.82.219.234
+          FallbackNTP=162.159.200.1 162.159.200.123
           EOF
 
           sudo tee "$ROOTFS/etc/ssh/sshd_config.d/10-image.conf" >/dev/null <<'EOF'
@@ -244,20 +255,10 @@ jobs:
           nf_conntrack
           EOF
 
-          sudo tee "$ROOTFS/etc/systemd/system/sys-fs-bpf.mount" >/dev/null <<'EOF'
-          [Unit]
-          Description=BPF filesystem
-          Before=local-fs.target
-
-          [Mount]
-          What=bpf
-          Where=/sys/fs/bpf
-          Type=bpf
-          Options=mode=755,nosuid,nodev,noexec
-
-          [Install]
-          WantedBy=local-fs.target
-          EOF
+          # Do NOT create a sys-fs-bpf.mount unit: systemd mounts /sys/fs/bpf
+          # itself as an API filesystem and refuses a custom mount unit
+          # ("Cannot create mount unit for API file system"), which produces
+          # a bad-setting error on every boot. bpffs is already available.
 
           printf 'root:%s\n' "$ROOT_PASSWORD" | sudo chroot "$ROOTFS" chpasswd
 
@@ -309,7 +310,6 @@ jobs:
           systemctl enable ssh.service
           systemctl enable systemd-networkd.service
           systemctl enable systemd-timesyncd.service
-          systemctl enable sys-fs-bpf.mount
           ssh-keygen -A
           /usr/sbin/update-initramfs -u -k all
           apt-get clean
@@ -319,6 +319,12 @@ jobs:
           sudo umount "$ROOTFS/dev" || true
           sudo umount "$ROOTFS/sys" || true
           sudo umount "$ROOTFS/proc" || true
+
+          # debootstrap runs as the runner user; directories it created before
+          # dropping privileges (/, /etc and subdirs) can keep uid 1001. Reset
+          # every non-root-owned entry to root so the shipped image is clean.
+          sudo find "$ROOTFS" -xdev \( -user 1001 -o -group 1001 \) \
+            -exec chown root:root {} +
 
       - name: Build bootable raw disk image
         run: |
@@ -399,6 +405,13 @@ jobs:
           test -f "$MNT/boot/efi/EFI/BOOT/BOOTX64.EFI" || \
             test -f "$MNT/boot/efi/EFI/BOOT/BOOTAA64.EFI"
 
+          # Expose the exact kernel version baked into the image to later steps.
+          KERNEL_VERSION=$(sudo find "$MNT/boot" -maxdepth 1 -type f -name 'vmlinuz-*' \
+            -printf '%f\n' | sed 's/^vmlinuz-//' | sort -V | tail -n 1)
+          test -n "$KERNEL_VERSION" || { echo "ERROR: no kernel image found in $MNT/boot" >&2; exit 1; }
+          echo "IMAGE_KERNEL_VERSION=$KERNEL_VERSION" >> "$GITHUB_ENV"
+          echo "Image kernel version: $KERNEL_VERSION"
+
       - name: Package and verify artifacts
         run: |
           set -euo pipefail
@@ -431,6 +444,9 @@ jobs:
           - \`${BASE}-rootfs.tar.xz\` — root filesystem tarball for chroot / existing systems
           - \`SHA256SUMS\` — checksums
 
+          ## Kernel
+          - Version: \`${IMAGE_KERNEL_VERSION:-unknown}\`
+
           ## Default access
           - User: \`root\`
           - Password: \`$ROOT_PASSWORD\`
@@ -441,8 +457,8 @@ jobs:
           ## Preconfigured
           - OpenSSH server enabled, root password login allowed
           - systemd-networkd with DHCPv4 on common physical/virtual NIC names (en*, eth*, ens*, enp*, wlan*, wlp*, vnet*, net*); dhcpcd available as a manual fallback
-          - systemd-timesyncd enabled; static public DNS in /etc/resolv.conf (systemd-resolved is not installed)
-          - \`/sys/fs/bpf\` mounted at boot
+          - systemd-timesyncd enabled with IPv4-only NTP servers (no IPv6 timeouts); static public DNS in /etc/resolv.conf (systemd-resolved is not installed)
+          - \`/sys/fs/bpf\` mounted at boot by systemd (API filesystem)
           - \`tun\` and \`nf_conntrack\` loaded at boot
           - IP forwarding, rp_filter=0, larger socket buffers in \`/etc/sysctl.d/99-network-tuning.conf\`
           - Tools: \`curl\`, \`wget\`, \`jq\`, \`tar\`, \`xz-utils\`, \`unzip\`, \`libcap2-bin\`, \`iptables\`, \`iproute2\`, \`dhcpcd\`, \`bpftool\`, \`kmod\`, \`nano\`
@@ -467,6 +483,8 @@ jobs:
 
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" "$DIST"/* --clobber
+            # Refresh notes so the kernel version reflects this rebuild.
+            gh release edit "$TAG" --notes-file "$NOTES"
           else
             gh release create "$TAG" "$DIST"/* \
               --title "$BASE minimal Debian ($(date -u +%Y-%m-%d))" \
