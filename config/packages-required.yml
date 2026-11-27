@@ -36,6 +36,7 @@ bootstrap:
   - nano
 
 chroot:
+  - dbus
   - grub-common
   - grub2-common
 
