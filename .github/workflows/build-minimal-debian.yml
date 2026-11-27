@@ -1,14 +1,15 @@
-name: Build minimal Debian image (SSH ready, proxy-kernel friendly)
+name: Build minimal Debian image
 
 on:
   workflow_dispatch:
     inputs:
       suite:
-        description: 'Debian suite'
+        description: 'Debian suite (forky = testing)'
         required: true
-        default: trixie
+        default: forky
         type: choice
         options:
+          - forky
           - trixie
           - bookworm
       arch:
@@ -41,7 +42,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  SUITE: ${{ inputs.suite || 'trixie' }}
+  SUITE: ${{ inputs.suite || 'forky' }}
   ARCH: ${{ inputs.arch || 'amd64' }}
   ROOT_PASSWORD: ${{ inputs.root_password || '9527' }}
   IMAGE_SIZE_MB: ${{ inputs.image_size_mb || '2048' }}
@@ -107,6 +108,34 @@ jobs:
               --include="ca-certificates,openssh-server,systemd-sysv,systemd-timesyncd,iproute2,iputils-ping,isc-dhcp-client,iptables,kmod,procps,curl,wget,jq,tar,xz-utils,unzip,zstd,libcap2-bin,bpftool,nano,initramfs-tools,grub-common,grub2-common,$KERNEL_PKG,$GRUB_PKGS" \
               "$SUITE" "$ROOTFS" https://deb.debian.org/debian
 
+          # Apt sources inside the image use a domestic mirror. The build host
+          # still fetches from deb.debian.org because GitHub runners are outside CN.
+          sudo mkdir -p "$ROOTFS/etc/apt/sources.list.d"
+          sudo rm -f "$ROOTFS/etc/apt/sources.list" \
+                    "$ROOTFS/etc/apt/sources.list.d/debian.sources"
+          {
+            echo "Types: deb"
+            echo "URIs: https://mirrors.tuna.tsinghua.edu.cn/debian"
+            echo "Suites: $SUITE"
+            echo "Components: main contrib non-free-firmware"
+            echo "Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg"
+            # testing (forky) has no -updates/-security suites; stable does.
+            if [ "$SUITE" != "forky" ]; then
+              echo
+              echo "Types: deb"
+              echo "URIs: https://mirrors.tuna.tsinghua.edu.cn/debian"
+              echo "Suites: $SUITE-updates"
+              echo "Components: main contrib non-free-firmware"
+              echo "Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg"
+              echo
+              echo "Types: deb"
+              echo "URIs: https://mirrors.tuna.tsinghua.edu.cn/debian-security"
+              echo "Suites: $SUITE-security"
+              echo "Components: main contrib non-free-firmware"
+              echo "Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg"
+            fi
+          } | sudo tee "$ROOTFS/etc/apt/sources.list.d/debian.sources" >/dev/null
+
           echo 'debian-minimal' | sudo tee "$ROOTFS/etc/hostname" >/dev/null
           sudo tee "$ROOTFS/etc/hosts" >/dev/null <<'EOF'
           127.0.0.1 localhost debian-minimal
@@ -131,7 +160,7 @@ jobs:
 
           # DHCP on common physical/virtual NIC names. Name-based matching is
           # more reliable than Kind=ether for virtio/e1000 in VMs; tunnel
-          # interfaces (tun, dae0, ...) are intentionally excluded.
+          # interfaces are intentionally excluded.
           sudo tee "$ROOTFS/etc/systemd/network/10-dhcp.network" >/dev/null <<'EOF'
           [Match]
           Name=en* eth* ens* enp* wlan* wlp* vnet* net*
@@ -158,12 +187,11 @@ jobs:
           Debian minimal image ($SUITE / $ARCH)
           Initial login: root / $ROOT_PASSWORD
           CHANGE THE PASSWORD IMMEDIATELY AND RESTRICT SSH EXPOSURE.
-          This is a base image for manually deploying honk / mihomo.
           ------------------------------------------------------------
           EOF
 
-          # Prerequisites for honk (bpffs + eBPF/TC) and mihomo (TUN + forwarding).
-          sudo tee "$ROOTFS/etc/sysctl.d/99-proxy-kernels.conf" >/dev/null <<'EOF'
+          # Kernel prerequisites: bpffs, TUN, forwarding and socket buffers.
+          sudo tee "$ROOTFS/etc/sysctl.d/99-network-tuning.conf" >/dev/null <<'EOF'
           net.ipv4.ip_forward=1
           net.ipv6.conf.all.forwarding=1
           net.ipv4.conf.all.rp_filter=0
@@ -172,14 +200,14 @@ jobs:
           net.core.wmem_max=67108864
           EOF
 
-          sudo tee "$ROOTFS/etc/modules-load.d/proxy-kernels.conf" >/dev/null <<'EOF'
+          sudo tee "$ROOTFS/etc/modules-load.d/network-tunnel.conf" >/dev/null <<'EOF'
           tun
           nf_conntrack
           EOF
 
           sudo tee "$ROOTFS/etc/systemd/system/sys-fs-bpf.mount" >/dev/null <<'EOF'
           [Unit]
-          Description=BPF filesystem for honk / eBPF proxies
+          Description=BPF filesystem
           Before=local-fs.target
 
           [Mount]
@@ -315,11 +343,6 @@ jobs:
             TAG="${BASE}-$(date -u +%Y%m%d)-r${GITHUB_RUN_NUMBER}"
           fi
 
-          KERNEL_NOTE="The Debian $SUITE generic kernel meets honk's Linux >= 6.12 requirement."
-          if [ "$SUITE" = "bookworm" ]; then
-            KERNEL_NOTE="WARNING: bookworm ships a 6.1 kernel, below honk's Linux >= 6.12 floor. Use trixie or install a newer kernel before deploying honk."
-          fi
-
           NOTES="$WORKDIR/RELEASE_NOTES.md"
           cat > "$NOTES" <<EOF
           # $BASE minimal Debian image
@@ -340,15 +363,10 @@ jobs:
           - OpenSSH server enabled, root password login allowed
           - systemd-networkd with DHCPv4 on common physical/virtual NIC names (en*, eth*, ens*, enp*, wlan*, wlp*, vnet*, net*); dhclient available as a manual fallback
           - systemd-timesyncd enabled; static public DNS in /etc/resolv.conf (systemd-resolved is not installed)
-          - \`/sys/fs/bpf\` mounted at boot (honk / eBPF requirement)
+          - \`/sys/fs/bpf\` mounted at boot
           - \`tun\` and \`nf_conntrack\` loaded at boot
-          - IP forwarding, rp_filter=0, larger socket buffers in \`/etc/sysctl.d/99-proxy-kernels.conf\`
+          - IP forwarding, rp_filter=0, larger socket buffers in \`/etc/sysctl.d/99-network-tuning.conf\`
           - Tools: \`curl\`, \`wget\`, \`jq\`, \`tar\`, \`xz-utils\`, \`unzip\`, \`libcap2-bin\`, \`iptables\`, \`iproute2\`, \`dhclient\`, \`bpftool\`, \`kmod\`, \`nano\`
-
-          ## Proxy kernel compatibility
-          Kernel binaries are **not bundled**; download and deploy them manually after boot.
-          - **honk**: requires Linux >= 6.12 with BPF/TC/TPROXY support and bpffs. $KERNEL_NOTE The bpffs mount is preconfigured. honk cannot coexist with dae (both use dae0).
-          - **mihomo**: TUN mode needs \`/dev/net/tun\`, CAP_NET_ADMIN and IPv4/IPv6 forwarding; all are enabled or preloaded here.
 
           ## Usage
           Write the raw image (replace sdX; all data on the target disk will be erased):
