@@ -3,15 +3,6 @@ name: Build minimal Debian image
 on:
   workflow_dispatch:
     inputs:
-      suite:
-        description: 'Debian suite (forky = testing)'
-        required: true
-        default: forky
-        type: choice
-        options:
-          - forky
-          - trixie
-          - bookworm
       arch:
         description: 'Target architecture (arm64 needs a public repo or an arm64 larger runner)'
         required: true
@@ -42,7 +33,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  SUITE: ${{ inputs.suite || 'forky' }}
+  SUITE: forky
   ARCH: ${{ inputs.arch || 'amd64' }}
   ROOT_PASSWORD: ${{ inputs.root_password || '9527' }}
   IMAGE_SIZE_MB: ${{ inputs.image_size_mb || '2048' }}
@@ -74,7 +65,7 @@ jobs:
             "https://deb.debian.org/debian/pool/main/d/debian-archive-keyring/$KEYRING_DEB"
           sudo dpkg -i /tmp/debian-archive-keyring.deb
 
-          # Older debootstrap releases may not ship a trixie script.
+          # Older debootstrap releases may not ship a forky script.
           if [ ! -e "/usr/share/debootstrap/scripts/$SUITE" ] && \
              [ ! -L "/usr/share/debootstrap/scripts/$SUITE" ]; then
             sudo ln -s /usr/share/debootstrap/scripts/bookworm \
@@ -105,7 +96,7 @@ jobs:
               --arch="$ARCH" \
               --variant=minbase \
               --keyring=/usr/share/keyrings/debian-archive-keyring.gpg \
-              --include="ca-certificates,openssh-server,systemd-sysv,systemd-timesyncd,iproute2,iputils-ping,isc-dhcp-client,iptables,kmod,procps,curl,wget,jq,tar,xz-utils,unzip,zstd,libcap2-bin,bpftool,nano,initramfs-tools,grub-common,grub2-common,$KERNEL_PKG,$GRUB_PKGS" \
+              --include="ca-certificates,openssh-server,systemd-sysv,systemd-timesyncd,iproute2,iputils-ping,dhcpcd-base,iptables,kmod,procps,curl,wget,jq,tar,xz-utils,unzip,zstd,libcap2-bin,bpftool,nano,initramfs-tools,grub-common,grub2-common,$KERNEL_PKG,$GRUB_PKGS" \
               "$SUITE" "$ROOTFS" https://deb.debian.org/debian
 
           # Apt sources inside the image use a domestic mirror. The build host
@@ -113,28 +104,14 @@ jobs:
           sudo mkdir -p "$ROOTFS/etc/apt/sources.list.d"
           sudo rm -f "$ROOTFS/etc/apt/sources.list" \
                     "$ROOTFS/etc/apt/sources.list.d/debian.sources"
-          {
-            echo "Types: deb"
-            echo "URIs: https://mirrors.tuna.tsinghua.edu.cn/debian"
-            echo "Suites: $SUITE"
-            echo "Components: main contrib non-free-firmware"
-            echo "Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg"
-            # testing (forky) has no -updates/-security suites; stable does.
-            if [ "$SUITE" != "forky" ]; then
-              echo
-              echo "Types: deb"
-              echo "URIs: https://mirrors.tuna.tsinghua.edu.cn/debian"
-              echo "Suites: $SUITE-updates"
-              echo "Components: main contrib non-free-firmware"
-              echo "Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg"
-              echo
-              echo "Types: deb"
-              echo "URIs: https://mirrors.tuna.tsinghua.edu.cn/debian-security"
-              echo "Suites: $SUITE-security"
-              echo "Components: main contrib non-free-firmware"
-              echo "Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg"
-            fi
-          } | sudo tee "$ROOTFS/etc/apt/sources.list.d/debian.sources" >/dev/null
+          # Debian testing (forky) has no -updates/-security suites.
+          sudo tee "$ROOTFS/etc/apt/sources.list.d/debian.sources" >/dev/null <<'EOF'
+          Types: deb
+          URIs: https://mirrors.tuna.tsinghua.edu.cn/debian
+          Suites: forky
+          Components: main contrib non-free-firmware
+          Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+          EOF
 
           echo 'debian-minimal' | sudo tee "$ROOTFS/etc/hostname" >/dev/null
           sudo tee "$ROOTFS/etc/hosts" >/dev/null <<'EOF'
@@ -361,12 +338,12 @@ jobs:
 
           ## Preconfigured
           - OpenSSH server enabled, root password login allowed
-          - systemd-networkd with DHCPv4 on common physical/virtual NIC names (en*, eth*, ens*, enp*, wlan*, wlp*, vnet*, net*); dhclient available as a manual fallback
+          - systemd-networkd with DHCPv4 on common physical/virtual NIC names (en*, eth*, ens*, enp*, wlan*, wlp*, vnet*, net*); dhcpcd available as a manual fallback
           - systemd-timesyncd enabled; static public DNS in /etc/resolv.conf (systemd-resolved is not installed)
           - \`/sys/fs/bpf\` mounted at boot
           - \`tun\` and \`nf_conntrack\` loaded at boot
           - IP forwarding, rp_filter=0, larger socket buffers in \`/etc/sysctl.d/99-network-tuning.conf\`
-          - Tools: \`curl\`, \`wget\`, \`jq\`, \`tar\`, \`xz-utils\`, \`unzip\`, \`libcap2-bin\`, \`iptables\`, \`iproute2\`, \`dhclient\`, \`bpftool\`, \`kmod\`, \`nano\`
+          - Tools: \`curl\`, \`wget\`, \`jq\`, \`tar\`, \`xz-utils\`, \`unzip\`, \`libcap2-bin\`, \`iptables\`, \`iproute2\`, \`dhcpcd\`, \`bpftool\`, \`kmod\`, \`nano\`
 
           ## Usage
           Write the raw image (replace sdX; all data on the target disk will be erased):
